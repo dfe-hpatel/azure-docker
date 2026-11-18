@@ -1,0 +1,156 @@
+name: Docker Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: Terraform workspace
+        required: true
+        type: choice
+        default: prd-uks # Prod UK South
+        options:
+          - prd-uks # Prod UK South
+          - prd-ukw # Prod UK West
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_BACKEND_RG: ${{ vars.TFSTATE_RESOURCE_GROUP }}
+  TF_BACKEND_STG: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+  TF_BACKEND_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+  TF_BACKEND_SUB_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  DEFAULT_WORKSPACE: prd-uks
+
+  ARM_USE_OIDC: "true"
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+  TF_VAR_repository: ${{ github.repository }}
+  
+
+jobs:
+  plan:
+    name: Terraform Validate and Plan
+    runs-on: ubuntu-latest
+    environment: prod-build
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set workspace env
+        run: | 
+          echo "TF_WORKSPACE_NAME=${{ github.event.inputs.workspace }}" >> "$GITHUB_ENV"
+          echo "TFVARS_FILE=./tfvars/${{ github.event.inputs.workspace }}.tfvars" >> "$GITHUB_ENV"
+          echo "TFPLAN_FILE=${{ github.event.inputs.workspace }}.tfplan" >> "$GITHUB_ENV"
+          echo "BACKEND_KEY=azure-sandbox.tfstate" >> "$GITHUB_ENV"
+          echo "TF_VAR_git_commit=${GITHUB_SHA::7}" >> "$GITHUB_ENV"          
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="subscription_id=${TF_BACKEND_SUB_ID}" \
+            -backend-config="tenant_id=${ARM_TENANT_ID}" \
+            -backend-config="resource_group_name=${TF_BACKEND_RG}" \
+            -backend-config="storage_account_name=${TF_BACKEND_STG}" \
+            -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
+            -backend-config="key=${BACKEND_KEY}" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+
+      - name: Terraform Workspace
+        run: terraform workspace select -or-create ${{ github.event.inputs.workspace }}
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -input=false -var-file=${{ env.TFVARS_FILE}} -out=${{ env.TFPLAN_FILE}}
+
+      - name: Upload tfplan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.workspace }}
+          path: ./${{ env.TFPLAN_FILE }}
+          if-no-files-found: error
+
+  apply:
+    name: Terraform Apply
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: prod-deploy
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set workspace env
+        run: |
+          echo "TF_WORKSPACE_NAME=${{ github.event.inputs.workspace }}" >> "$GITHUB_ENV"
+          echo "TFVARS_FILE=./tfvars/${{ github.event.inputs.workspace }}.tfvars" >> "$GITHUB_ENV"
+          echo "TFPLAN_FILE=${{ github.event.inputs.workspace }}.tfplan" >> "$GITHUB_ENV"
+          echo "BACKEND_KEY=azure-sandbox.tfstate" >> "$GITHUB_ENV"
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+
+      - name: Download tfplan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.workspace }}
+          path: ./
+
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="subscription_id=${TF_BACKEND_SUB_ID}" \
+            -backend-config="tenant_id=${ARM_TENANT_ID}" \
+            -backend-config="resource_group_name=${TF_BACKEND_RG}" \
+            -backend-config="storage_account_name=${TF_BACKEND_STG}" \
+            -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
+            -backend-config="key=${BACKEND_KEY}" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+
+      - name: Terraform Workspace
+        run: terraform workspace select -or-create ${{ github.event.inputs.workspace }}
+
+      - name: Verify plan file exists
+        run: test -f ${{ env.TFPLAN_FILE}}
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve ${{ env.TFPLAN_FILE}}
