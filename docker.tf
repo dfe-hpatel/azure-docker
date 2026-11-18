@@ -14,8 +14,8 @@ resource "azurerm_container_app" "container_app" {
     container {
       name   = "containerapp"
       image  = "mcr.microsoft.com/k8se/quickstart:latest"
-      cpu    = 1
-      memory = "1.5Gi"
+      cpu    = 0.5
+      memory = "1.0Gi"
     }
   }
 }
